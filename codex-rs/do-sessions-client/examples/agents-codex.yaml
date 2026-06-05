@@ -1,0 +1,49 @@
+# Codex hosted-agent session manifest (DO harness-api inline create).
+#
+# The harness-api CreateSession endpoint accepts this manifest inline as the
+# request body:
+#
+#   POST /v2/agents/sessions
+#   Content-Type: application/x-yaml
+#
+# This is a TEMPLATE: the ${VAR} placeholders are filled from your environment.
+# Render + create in one shot (envsubst keeps secrets out of the committed file):
+#
+#   export OPENAI_API_KEY=sk-...
+#   export OPENAI_BASE_URL=https://api.openai.com/v1   # or your gateway
+#   export MODEL=gpt-5.3-codex
+#   export GITHUB_TOKEN=ghp_...                        # optional, for git tools
+#
+#   envsubst < agents-codex.yaml \
+#     | curl -sS -X POST "${AUTH[@]}" \
+#         -H "Content-Type: application/x-yaml" \
+#         --data-binary @- "${BASE_URL}/v2/agents/sessions"
+#
+# Auth + BASE_URL are supplied by the caller (DO IAM token via doctl, and
+# DO_HARNESS_BASE_URL for public vs staging).
+
+apiVersion: agents.digitalocean.com/v1alpha1
+kind: Agent
+metadata:
+  name: harness-demo-codex
+spec:
+  runtime:
+    # Run the Codex CLI agent inside the sandbox.
+    adapter: codex
+  sandbox:
+    template: coding
+    persistentWorkspace: true
+  env:
+    RUST_LOG: info
+    # Suppress Codex's own telemetry/usage reporting.
+    DISABLE_TELEMETRY: "true"
+    # Codex auth: the harness runs `codex login --with-api-key` from this.
+    OPENAI_API_KEY: "${OPENAI_API_KEY}"
+    # Point Codex at a gateway/proxy if you route through one; else the public API.
+    OPENAI_BASE_URL: "${OPENAI_BASE_URL}"
+    # Model pin for the session's turns. MODEL mirrors the opencode manifest key;
+    # CODEX_MODEL is what the Codex launcher reads. Keep whichever the build honors.
+    MODEL: "${MODEL}"
+    CODEX_MODEL: "${MODEL}"
+    # Optional: enables the GitHub builtin tools inside the VM. Remove if unused.
+    GITHUB_TOKEN: "${GITHUB_TOKEN}"
