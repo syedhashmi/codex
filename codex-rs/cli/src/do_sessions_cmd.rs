@@ -21,6 +21,7 @@ use codex_do_sessions_client::SessionStatus;
 use codex_do_sessions_client::resolve_base_url;
 use codex_do_sessions_client::resolve_token;
 use futures::StreamExt;
+use owo_colors::OwoColorize;
 
 #[derive(Debug, Parser)]
 pub struct DoSessionsCli {
@@ -315,9 +316,8 @@ async fn attach(client: &DoSessionsClient, args: AttachArgs) -> anyhow::Result<(
     use tokio::io::BufReader;
 
     let sid = args.session_id.clone();
-    println!("attached to {sid}");
-    println!("  type a message and press enter; a/r/d resolves a pending approval; /exit detaches");
-    println!("{}", "-".repeat(70));
+    let session = client.get_session(&sid).await.ok();
+    print_banner(&sid, session.as_ref(), client.base_url());
 
     // request_id of any pending HITL the user must answer.
     let pending: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -340,46 +340,131 @@ async fn attach(client: &DoSessionsClient, args: AttachArgs) -> anyhow::Result<(
         };
         let mut stream = Box::pin(stream);
         let mut out = std::io::stdout();
-        while let Some(item) = stream.next().await {
-            match item {
-                Ok(ev) => match ev.kind() {
-                    EventKind::TokenChunk => {
-                        if let Some(t) = ev.text() {
-                            let _ = write!(out, "{t}");
+        // Whether we've printed the "codex ▸" label for the active turn so
+        // streamed tokens flow under one labeled block.
+        let mut agent_labeled = false;
+        // `dirty` = agent produced output since the last prompt. An inactivity
+        // timer reprints the prompt once the stream goes quiet, so we recover
+        // the prompt even when a turn ends without a `run.completed` we can see
+        // (e.g. multi-turn idle markers arrive as suppressed `run.log`s).
+        let mut dirty = false;
+        let quiet = std::time::Duration::from_millis(700);
+        let idle = tokio::time::sleep(quiet);
+        tokio::pin!(idle);
+        loop {
+            tokio::select! {
+                maybe = stream.next() => {
+                    let Some(item) = maybe else { break; };
+                    let ev = match item {
+                        Ok(ev) => ev,
+                        Err(e) => {
+                            let _ = writeln!(out, "\n{} {e}", "stream error:".red());
+                            break;
+                        }
+                    };
+                    idle.as_mut().reset(tokio::time::Instant::now() + quiet);
+                    match ev.kind() {
+                        EventKind::RunStarted => {
+                            agent_labeled = false;
+                        }
+                        EventKind::TokenChunk => {
+                            if let Some(t) = ev.text() {
+                                if !agent_labeled {
+                                    let _ = write!(out, "\n{} ", "codex ▸".green().bold());
+                                    agent_labeled = true;
+                                }
+                                let _ = write!(out, "{t}");
+                                let _ = out.flush();
+                                dirty = true;
+                            }
+                        }
+                        EventKind::ToolCallStarted => {
+                            let _ = write!(
+                                out,
+                                "\n  {} {}",
+                                "⚙".dimmed(),
+                                ev.tool_name().unwrap_or("tool").dimmed()
+                            );
+                            agent_labeled = false;
                             let _ = out.flush();
+                            dirty = true;
                         }
-                    }
-                    EventKind::HitlRequested => {
-                        if let Some(req_id) = ev.hitl_request_id() {
-                            *pending_stream.lock().unwrap() = Some(req_id);
-                        }
-                        // The harness sends a bare notice first, then the
-                        // detailed payload. Only prompt once we have details.
-                        if ev.hitl_payload().is_some() {
-                            let _ = writeln!(out, "\n{}", render_event(&ev));
-                            let _ = writeln!(out, "  press  a=approve  r=reject  d=defer");
+                        EventKind::ToolCallCompleted => {
+                            let _ = writeln!(out, " {}", "done".dimmed());
+                            agent_labeled = false;
                             let _ = out.flush();
+                            dirty = true;
                         }
+                        EventKind::HitlRequested => {
+                            if let Some(req_id) = ev.hitl_request_id() {
+                                *pending_stream.lock().unwrap() = Some(req_id);
+                            }
+                            // Bare notice first, detailed payload second; prompt
+                            // only once we have the command details.
+                            if ev.hitl_payload().is_some() {
+                                let action = ev.hitl_action().unwrap_or("approval");
+                                let _ = writeln!(
+                                    out,
+                                    "\n{}  {}",
+                                    "⏸ approval needed".yellow().bold(),
+                                    action.dimmed()
+                                );
+                                if let Some(cmd) = ev.hitl_command() {
+                                    let _ = writeln!(out, "    {} {}", "$".dimmed(), cmd);
+                                }
+                                let _ = writeln!(
+                                    out,
+                                    "    {}    {}    {}",
+                                    " a ⏵ approve ".black().on_green().bold(),
+                                    " r ⏵ reject ".white().on_red().bold(),
+                                    " d ⏵ defer ".black().on_yellow().bold(),
+                                );
+                                agent_labeled = false;
+                                print_prompt(&mut out);
+                                dirty = false;
+                            }
+                        }
+                        EventKind::HitlResolved => {
+                            *pending_stream.lock().unwrap() = None;
+                            agent_labeled = false;
+                        }
+                        EventKind::RunCompleted => {
+                            *pending_stream.lock().unwrap() = None;
+                            agent_labeled = false;
+                            let _ = writeln!(out);
+                            print_prompt(&mut out);
+                            dirty = false;
+                        }
+                        EventKind::RunFailed => {
+                            *pending_stream.lock().unwrap() = None;
+                            agent_labeled = false;
+                            let msg = ev.data_str("message").unwrap_or("run failed");
+                            let _ = writeln!(out, "\n{} {}", "✗".red().bold(), msg.red());
+                            print_prompt(&mut out);
+                            dirty = false;
+                        }
+                        // session.updated / logs / unknown: suppressed in the
+                        // chat view; the inactivity timer handles the prompt.
+                        _ => {}
                     }
-                    EventKind::HitlResolved
-                    | EventKind::RunCompleted
-                    | EventKind::RunFailed => {
-                        *pending_stream.lock().unwrap() = None;
-                        let _ = writeln!(out, "\n{}", render_event(&ev));
-                        let _ = out.flush();
+                }
+                _ = &mut idle, if dirty => {
+                    // Output settled and no terminal event arrived; reprint the
+                    // prompt so the user is never left without one. Skip while a
+                    // HITL approval is pending (its own prompt is already shown).
+                    if pending_stream.lock().unwrap().is_none() {
+                        let _ = writeln!(out);
+                        print_prompt(&mut out);
                     }
-                    _ => {
-                        let _ = writeln!(out, "{}", render_event(&ev));
-                        let _ = out.flush();
-                    }
-                },
-                Err(e) => {
-                    eprintln!("\nstream error: {e}");
-                    break;
+                    dirty = false;
                 }
             }
         }
     });
+
+    // Initial prompt; subsequent prompts are reprinted by the stream task after
+    // each turn completes / approval is requested.
+    print_prompt(&mut std::io::stdout());
 
     // Input loop on stdin.
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
@@ -403,21 +488,87 @@ async fn attach(client: &DoSessionsClient, args: AttachArgs) -> anyhow::Result<(
                     .resolve_hitl(&sid, &req_id, outcome, None, ResolutionSource::InlineKeystroke)
                     .await?;
                 *pending.lock().unwrap() = None;
-                println!("  -> {outcome:?}");
+                println!("  {}", format!("→ {}", outcome_label(outcome)).dimmed());
                 continue;
             }
         }
 
         // Otherwise send it as a chat message.
-        match client.send_input(&sid, trimmed).await {
-            Ok(run_id) => println!("  (sent · run {run_id})"),
-            Err(e) => eprintln!("  send failed: {e}"),
+        if let Err(e) = client.send_input(&sid, trimmed).await {
+            eprintln!("  {} {e}", "send failed:".red());
         }
     }
 
     stream_task.abort();
-    println!("detached from {sid} (session still running server-side)");
+    println!("\n{}", format!("detached from {sid} (still running)").dimmed());
     Ok(())
+}
+
+fn outcome_label(o: HitlOutcome) -> &'static str {
+    match o {
+        HitlOutcome::Approve => "approved",
+        HitlOutcome::Reject => "rejected",
+        HitlOutcome::Defer => "deferred",
+        HitlOutcome::Unspecified => "unspecified",
+    }
+}
+
+/// Print the `you ▸` input prompt (no trailing newline).
+fn print_prompt<W: std::io::Write>(out: &mut W) {
+    let _ = write!(out, "\n{} ", "you ▸".cyan().bold());
+    let _ = out.flush();
+}
+
+/// ASCII-art wordmark shown at the top of the attach banner.
+const CODEX_ART: [&str; 5] = [
+    r"  ____  ___  ____  _____ __  __",
+    r" / ___|/ _ \|  _ \| ____|\ \/ /",
+    r"| |   | | | | | | |  _|   \  / ",
+    r"| |___| |_| | |_| | |___  /  \ ",
+    r" \____|\___/|____/|_____|/_/\_\",
+];
+
+/// Print a banner with an ASCII-art wordmark plus session + endpoint details.
+fn print_banner(
+    sid: &str,
+    session: Option<&codex_do_sessions_client::Session>,
+    base_url: &str,
+) {
+    let agent = session
+        .and_then(|s| s.agent_kind)
+        .map(|a| a.label())
+        .unwrap_or("agent");
+    let status = session
+        .and_then(|s| s.status)
+        .map(|s| s.label())
+        .unwrap_or("?");
+    let host = base_url
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .unwrap_or(base_url);
+
+    println!();
+    for line in CODEX_ART {
+        println!("{}", line.cyan().bold());
+    }
+    println!("{}", "  on DigitalOcean · hosted agent".dimmed());
+    println!();
+    println!("  {}  {}", "session ".dimmed(), sid);
+    println!(
+        "  {}  {} {} {}",
+        "agent   ".dimmed(),
+        agent,
+        "·".dimmed(),
+        status
+    );
+    println!("  {}  {}", "endpoint".dimmed(), host.dimmed());
+    println!();
+    println!(
+        "{}",
+        "  type to chat · a/r/d resolves approvals · /exit detaches".dimmed()
+    );
 }
 
 fn hitl_key(s: &str) -> Option<HitlOutcome> {
