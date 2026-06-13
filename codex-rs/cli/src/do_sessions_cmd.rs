@@ -11,6 +11,7 @@ use anyhow::anyhow;
 use clap::Args;
 use clap::Parser;
 use clap::Subcommand;
+use codex_arg0::Arg0DispatchPaths;
 use codex_do_sessions_client::AgentKind;
 use codex_do_sessions_client::DoSessionsClient;
 use codex_do_sessions_client::EventKind;
@@ -21,7 +22,6 @@ use codex_do_sessions_client::SessionStatus;
 use codex_do_sessions_client::resolve_base_url;
 use codex_do_sessions_client::resolve_token;
 use futures::StreamExt;
-use owo_colors::OwoColorize;
 
 #[derive(Debug, Parser)]
 pub struct DoSessionsCli {
@@ -137,27 +137,31 @@ pub struct StreamArgs {
 #[derive(Debug, Args)]
 pub struct AttachArgs {
     pub session_id: String,
-    /// Backfill events strictly after this event id before going live.
-    #[arg(long = "replay-from", value_name = "EVENT_ID")]
-    pub replay_from: Option<String>,
 }
 
-pub async fn run(cli: DoSessionsCli) -> anyhow::Result<()> {
+pub async fn run(cli: DoSessionsCli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
     let base_url = resolve_base_url(cli.base_url.as_deref())
         .context("resolving harness-api base URL")?;
     let token = resolve_token().context("resolving DO IAM token")?;
-    let client = DoSessionsClient::new(base_url, token)?;
 
     match cli.command {
-        DoSessionsCommand::List(args) => list(&client, args).await,
-        DoSessionsCommand::Create(args) => create(&client, args).await,
-        DoSessionsCommand::Show(args) => show(&client, args).await,
-        DoSessionsCommand::Destroy(args) => destroy(&client, args).await,
-        DoSessionsCommand::Send(args) => send(&client, args).await,
-        DoSessionsCommand::Resolve(args) => resolve(&client, args).await,
-        DoSessionsCommand::AuthGithub(args) => auth_github(&client, args).await,
-        DoSessionsCommand::Stream(args) => stream(&client, args).await,
-        DoSessionsCommand::Attach(args) => attach(&client, args).await,
+        // `attach` launches the native TUI against the DO session rather than
+        // hitting the REST surface directly, so it needs the raw base_url/token.
+        DoSessionsCommand::Attach(args) => attach(args, base_url, token, arg0_paths).await,
+        command => {
+            let client = DoSessionsClient::new(base_url, token)?;
+            match command {
+                DoSessionsCommand::List(args) => list(&client, args).await,
+                DoSessionsCommand::Create(args) => create(&client, args).await,
+                DoSessionsCommand::Show(args) => show(&client, args).await,
+                DoSessionsCommand::Destroy(args) => destroy(&client, args).await,
+                DoSessionsCommand::Send(args) => send(&client, args).await,
+                DoSessionsCommand::Resolve(args) => resolve(&client, args).await,
+                DoSessionsCommand::AuthGithub(args) => auth_github(&client, args).await,
+                DoSessionsCommand::Stream(args) => stream(&client, args).await,
+                DoSessionsCommand::Attach(_) => unreachable!("attach handled above"),
+            }
+        }
     }
 }
 
@@ -308,275 +312,54 @@ async fn stream(client: &DoSessionsClient, args: StreamArgs) -> anyhow::Result<(
     Ok(())
 }
 
-async fn attach(client: &DoSessionsClient, args: AttachArgs) -> anyhow::Result<()> {
-    use std::io::Write;
-    use std::sync::Arc;
-    use std::sync::Mutex;
-    use tokio::io::AsyncBufReadExt;
-    use tokio::io::BufReader;
+/// Attach the native Codex TUI to a DO-hosted session. Instead of the bespoke
+/// REPL, this boots the real TUI against the `DoSession` app-server transport so
+/// streaming, diffs, reasoning, slash commands, and approval modals all work.
+async fn attach(
+    args: AttachArgs,
+    base_url: String,
+    token: String,
+    arg0_paths: Arg0DispatchPaths,
+) -> anyhow::Result<()> {
+    // The TUI owns argv parsing; we want a default invocation (no prompt, no
+    // flags) since the session/model/cwd come from the DO session itself.
+    let tui_cli = codex_tui::Cli::parse_from(["codex"]);
+    let launch =
+        codex_tui::AppServerLaunch::DoSession(codex_app_server_client::DoSessionConnectArgs {
+            session_id: args.session_id,
+            base_url,
+            token,
+        });
 
-    let sid = args.session_id.clone();
-    let session = client.get_session(&sid).await.ok();
-    print_banner(&sid, session.as_ref(), client.base_url());
+    // `App::run`'s async future is large on the remote-workspace entry path and
+    // overflows the default 8 MB main-thread stack when reached via the
+    // `do-sessions attach` call chain. Run the TUI on a dedicated thread with a
+    // generous stack (and its own runtime) so it has headroom. This is isolated
+    // to the attach path and does not affect the normal `codex` launch.
+    let exit_info = std::thread::Builder::new()
+        .name("codex-do-session-tui".to_string())
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || -> anyhow::Result<codex_tui::AppExitInfo> {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(|err| anyhow!("failed to build TUI runtime: {err}"))?;
+            runtime
+                .block_on(codex_tui::run_main(
+                    tui_cli,
+                    arg0_paths,
+                    codex_config::LoaderOverrides::default(),
+                    launch,
+                ))
+                .map_err(anyhow::Error::from)
+        })
+        .map_err(|err| anyhow!("failed to spawn TUI thread: {err}"))?
+        .join()
+        .map_err(|_| anyhow!("TUI thread panicked"))??;
 
-    // request_id of any pending HITL the user must answer.
-    let pending: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-
-    // Event stream task: owns a cloned client so the stream is 'static.
-    let client_stream = client.clone();
-    let sid_stream = sid.clone();
-    let replay_from = args.replay_from.clone();
-    let pending_stream = pending.clone();
-    let stream_task = tokio::spawn(async move {
-        let stream = match client_stream
-            .stream_session(&sid_stream, replay_from.as_deref(), false)
-            .await
-        {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("stream connect failed: {e}");
-                return;
-            }
-        };
-        let mut stream = Box::pin(stream);
-        let mut out = std::io::stdout();
-        // Whether we've printed the "codex ▸" label for the active turn so
-        // streamed tokens flow under one labeled block.
-        let mut agent_labeled = false;
-        // `dirty` = agent produced output since the last prompt. An inactivity
-        // timer reprints the prompt once the stream goes quiet, so we recover
-        // the prompt even when a turn ends without a `run.completed` we can see
-        // (e.g. multi-turn idle markers arrive as suppressed `run.log`s).
-        let mut dirty = false;
-        let quiet = std::time::Duration::from_millis(700);
-        let idle = tokio::time::sleep(quiet);
-        tokio::pin!(idle);
-        loop {
-            tokio::select! {
-                maybe = stream.next() => {
-                    let Some(item) = maybe else { break; };
-                    let ev = match item {
-                        Ok(ev) => ev,
-                        Err(e) => {
-                            let _ = writeln!(out, "\n{} {e}", "stream error:".red());
-                            break;
-                        }
-                    };
-                    idle.as_mut().reset(tokio::time::Instant::now() + quiet);
-                    match ev.kind() {
-                        EventKind::RunStarted => {
-                            agent_labeled = false;
-                        }
-                        EventKind::TokenChunk => {
-                            if let Some(t) = ev.text() {
-                                if !agent_labeled {
-                                    let _ = write!(out, "\n{} ", "codex ▸".green().bold());
-                                    agent_labeled = true;
-                                }
-                                let _ = write!(out, "{t}");
-                                let _ = out.flush();
-                                dirty = true;
-                            }
-                        }
-                        EventKind::ToolCallStarted => {
-                            let _ = write!(
-                                out,
-                                "\n  {} {}",
-                                "⚙".dimmed(),
-                                ev.tool_name().unwrap_or("tool").dimmed()
-                            );
-                            agent_labeled = false;
-                            let _ = out.flush();
-                            dirty = true;
-                        }
-                        EventKind::ToolCallCompleted => {
-                            let _ = writeln!(out, " {}", "done".dimmed());
-                            agent_labeled = false;
-                            let _ = out.flush();
-                            dirty = true;
-                        }
-                        EventKind::HitlRequested => {
-                            if let Some(req_id) = ev.hitl_request_id() {
-                                *pending_stream.lock().unwrap() = Some(req_id);
-                            }
-                            // Bare notice first, detailed payload second; prompt
-                            // only once we have the command details.
-                            if ev.hitl_payload().is_some() {
-                                let action = ev.hitl_action().unwrap_or("approval");
-                                let _ = writeln!(
-                                    out,
-                                    "\n{}  {}",
-                                    "⏸ approval needed".yellow().bold(),
-                                    action.dimmed()
-                                );
-                                if let Some(cmd) = ev.hitl_command() {
-                                    let _ = writeln!(out, "    {} {}", "$".dimmed(), cmd);
-                                }
-                                let _ = writeln!(
-                                    out,
-                                    "    {}    {}    {}",
-                                    " a ⏵ approve ".black().on_green().bold(),
-                                    " r ⏵ reject ".white().on_red().bold(),
-                                    " d ⏵ defer ".black().on_yellow().bold(),
-                                );
-                                agent_labeled = false;
-                                print_prompt(&mut out);
-                                dirty = false;
-                            }
-                        }
-                        EventKind::HitlResolved => {
-                            *pending_stream.lock().unwrap() = None;
-                            agent_labeled = false;
-                        }
-                        EventKind::RunCompleted => {
-                            *pending_stream.lock().unwrap() = None;
-                            agent_labeled = false;
-                            let _ = writeln!(out);
-                            print_prompt(&mut out);
-                            dirty = false;
-                        }
-                        EventKind::RunFailed => {
-                            *pending_stream.lock().unwrap() = None;
-                            agent_labeled = false;
-                            let msg = ev.data_str("message").unwrap_or("run failed");
-                            let _ = writeln!(out, "\n{} {}", "✗".red().bold(), msg.red());
-                            print_prompt(&mut out);
-                            dirty = false;
-                        }
-                        // session.updated / logs / unknown: suppressed in the
-                        // chat view; the inactivity timer handles the prompt.
-                        _ => {}
-                    }
-                }
-                _ = &mut idle, if dirty => {
-                    // Output settled and no terminal event arrived; reprint the
-                    // prompt so the user is never left without one. Skip while a
-                    // HITL approval is pending (its own prompt is already shown).
-                    if pending_stream.lock().unwrap().is_none() {
-                        let _ = writeln!(out);
-                        print_prompt(&mut out);
-                    }
-                    dirty = false;
-                }
-            }
-        }
-    });
-
-    // Initial prompt; subsequent prompts are reprinted by the stream task after
-    // each turn completes / approval is requested.
-    print_prompt(&mut std::io::stdout());
-
-    // Input loop on stdin.
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
-    loop {
-        let Some(line) = lines.next_line().await? else {
-            break; // EOF / Ctrl-D
-        };
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if trimmed == "/exit" || trimmed == "/quit" {
-            break;
-        }
-
-        // If a HITL is pending and the line is a decision key, resolve it.
-        let pend = pending.lock().unwrap().clone();
-        if let Some(req_id) = pend {
-            if let Some(outcome) = hitl_key(trimmed) {
-                client
-                    .resolve_hitl(&sid, &req_id, outcome, None, ResolutionSource::InlineKeystroke)
-                    .await?;
-                *pending.lock().unwrap() = None;
-                println!("  {}", format!("→ {}", outcome_label(outcome)).dimmed());
-                continue;
-            }
-        }
-
-        // Otherwise send it as a chat message.
-        if let Err(e) = client.send_input(&sid, trimmed).await {
-            eprintln!("  {} {e}", "send failed:".red());
-        }
-    }
-
-    stream_task.abort();
-    println!("\n{}", format!("detached from {sid} (still running)").dimmed());
-    Ok(())
-}
-
-fn outcome_label(o: HitlOutcome) -> &'static str {
-    match o {
-        HitlOutcome::Approve => "approved",
-        HitlOutcome::Reject => "rejected",
-        HitlOutcome::Defer => "deferred",
-        HitlOutcome::Unspecified => "unspecified",
-    }
-}
-
-/// Print the `you ▸` input prompt (no trailing newline).
-fn print_prompt<W: std::io::Write>(out: &mut W) {
-    let _ = write!(out, "\n{} ", "you ▸".cyan().bold());
-    let _ = out.flush();
-}
-
-/// ASCII-art wordmark shown at the top of the attach banner.
-const CODEX_ART: [&str; 5] = [
-    r"  ____  ___  ____  _____ __  __",
-    r" / ___|/ _ \|  _ \| ____|\ \/ /",
-    r"| |   | | | | | | |  _|   \  / ",
-    r"| |___| |_| | |_| | |___  /  \ ",
-    r" \____|\___/|____/|_____|/_/\_\",
-];
-
-/// Print a banner with an ASCII-art wordmark plus session + endpoint details.
-fn print_banner(
-    sid: &str,
-    session: Option<&codex_do_sessions_client::Session>,
-    base_url: &str,
-) {
-    let agent = session
-        .and_then(|s| s.agent_kind)
-        .map(|a| a.label())
-        .unwrap_or("agent");
-    let status = session
-        .and_then(|s| s.status)
-        .map(|s| s.label())
-        .unwrap_or("?");
-    let host = base_url
-        .trim_start_matches("https://")
-        .trim_start_matches("http://")
-        .split('/')
-        .next()
-        .unwrap_or(base_url);
-
-    println!();
-    for line in CODEX_ART {
-        println!("{}", line.cyan().bold());
-    }
-    println!("{}", "  on DigitalOcean · hosted agent".dimmed());
-    println!();
-    println!("  {}  {}", "session ".dimmed(), sid);
-    println!(
-        "  {}  {} {} {}",
-        "agent   ".dimmed(),
-        agent,
-        "·".dimmed(),
-        status
-    );
-    println!("  {}  {}", "endpoint".dimmed(), host.dimmed());
-    println!();
-    println!(
-        "{}",
-        "  type to chat · a/r/d resolves approvals · /exit detaches".dimmed()
-    );
-}
-
-fn hitl_key(s: &str) -> Option<HitlOutcome> {
-    match s {
-        "a" | "approve" => Some(HitlOutcome::Approve),
-        "r" | "reject" => Some(HitlOutcome::Reject),
-        "d" | "defer" => Some(HitlOutcome::Defer),
-        _ => None,
+    match exit_info.exit_reason {
+        codex_tui::ExitReason::Fatal(message) => Err(anyhow!(message)),
+        codex_tui::ExitReason::UserRequested => Ok(()),
     }
 }
 

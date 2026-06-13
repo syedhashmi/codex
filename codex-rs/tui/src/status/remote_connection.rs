@@ -14,6 +14,15 @@ pub(crate) fn remote_connection_status_value(
 ) -> Option<RemoteConnectionStatus> {
     let endpoint = match app_server_target {
         AppServerTarget::Embedded => return None,
+        AppServerTarget::DoSession { args } => {
+            let version = server_version
+                .map(|version| format!("v{version}"))
+                .unwrap_or_else(|| "unknown".to_string());
+            return Some(RemoteConnectionStatus {
+                address: format!("DO session {}", args.session_id),
+                version,
+            });
+        }
         AppServerTarget::LocalDaemon { endpoint } | AppServerTarget::Remote { endpoint } => {
             endpoint
         }

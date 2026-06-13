@@ -1263,7 +1263,7 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
                 root_remote_auth_token_env.as_deref(),
                 "do-sessions",
             )?;
-            do_sessions_cmd::run(do_sessions_cli).await?;
+            do_sessions_cmd::run(do_sessions_cli, arg0_paths.clone()).await?;
         }
         Some(Subcommand::Sandbox(mut sandbox_cli)) => {
             #[cfg(target_os = "windows")]
@@ -2093,11 +2093,15 @@ async fn run_interactive_tui(
         *slot = Some(auth_token);
     }
     let start_tui = || {
+        let launch = match remote_endpoint.clone() {
+            Some(endpoint) => codex_tui::AppServerLaunch::Remote(endpoint),
+            None => codex_tui::AppServerLaunch::Auto,
+        };
         codex_tui::run_main(
             interactive.clone(),
             arg0_paths.clone(),
             codex_config::LoaderOverrides::default(),
-            remote_endpoint.clone(),
+            launch,
         )
     };
     let mut attempted_repair = false;

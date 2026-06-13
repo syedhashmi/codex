@@ -56,7 +56,7 @@ fn main() -> anyhow::Result<()> {
             inner,
             arg0_paths,
             LoaderOverrides::default(),
-            /*explicit_remote_endpoint*/ None,
+            codex_tui::AppServerLaunch::Auto,
         )
         .await?;
         match exit_info.exit_reason {

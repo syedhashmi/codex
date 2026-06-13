@@ -15,6 +15,7 @@
 //! bridging async `mpsc` channels on both sides. Queues are bounded so overload
 //! surfaces as channel-full errors rather than unbounded memory growth.
 
+mod do_session;
 mod remote;
 
 use std::error::Error;
@@ -60,6 +61,8 @@ use tokio::time::timeout;
 use toml::Value as TomlValue;
 use tracing::warn;
 
+pub use crate::do_session::DoSessionAppServerClient;
+pub use crate::do_session::DoSessionConnectArgs;
 pub use crate::remote::RemoteAppServerClient;
 pub use crate::remote::RemoteAppServerConnectArgs;
 pub use crate::remote::RemoteAppServerEndpoint;
@@ -475,11 +478,13 @@ pub struct InProcessAppServerRequestHandle {
 pub enum AppServerRequestHandle {
     InProcess(InProcessAppServerRequestHandle),
     Remote(crate::remote::RemoteAppServerRequestHandle),
+    DoSession(crate::do_session::DoSessionAppServerRequestHandle),
 }
 
 pub enum AppServerClient {
     InProcess(InProcessAppServerClient),
     Remote(RemoteAppServerClient),
+    DoSession(DoSessionAppServerClient),
 }
 
 impl InProcessAppServerClient {
@@ -844,6 +849,7 @@ impl AppServerRequestHandle {
         match self {
             Self::InProcess(handle) => handle.request(request).await,
             Self::Remote(handle) => handle.request(request).await,
+            Self::DoSession(handle) => handle.request(request).await,
         }
     }
 
@@ -854,6 +860,7 @@ impl AppServerRequestHandle {
         match self {
             Self::InProcess(handle) => handle.request_typed(request).await,
             Self::Remote(handle) => handle.request_typed(request).await,
+            Self::DoSession(handle) => handle.request_typed(request).await,
         }
     }
 }
@@ -863,6 +870,7 @@ impl AppServerClient {
         match self {
             Self::InProcess(client) => client.request(request).await,
             Self::Remote(client) => client.request(request).await,
+            Self::DoSession(client) => client.request(request).await,
         }
     }
 
@@ -873,6 +881,7 @@ impl AppServerClient {
         match self {
             Self::InProcess(client) => client.request_typed(request).await,
             Self::Remote(client) => client.request_typed(request).await,
+            Self::DoSession(client) => client.request_typed(request).await,
         }
     }
 
@@ -880,6 +889,7 @@ impl AppServerClient {
         match self {
             Self::InProcess(client) => client.notify(notification).await,
             Self::Remote(client) => client.notify(notification).await,
+            Self::DoSession(client) => client.notify(notification).await,
         }
     }
 
@@ -891,6 +901,7 @@ impl AppServerClient {
         match self {
             Self::InProcess(client) => client.resolve_server_request(request_id, result).await,
             Self::Remote(client) => client.resolve_server_request(request_id, result).await,
+            Self::DoSession(client) => client.resolve_server_request(request_id, result).await,
         }
     }
 
@@ -902,6 +913,7 @@ impl AppServerClient {
         match self {
             Self::InProcess(client) => client.reject_server_request(request_id, error).await,
             Self::Remote(client) => client.reject_server_request(request_id, error).await,
+            Self::DoSession(client) => client.reject_server_request(request_id, error).await,
         }
     }
 
@@ -909,6 +921,7 @@ impl AppServerClient {
         match self {
             Self::InProcess(client) => client.next_event().await.map(Into::into),
             Self::Remote(client) => client.next_event().await,
+            Self::DoSession(client) => client.next_event().await,
         }
     }
 
@@ -916,6 +929,7 @@ impl AppServerClient {
         match self {
             Self::InProcess(client) => client.shutdown().await,
             Self::Remote(client) => client.shutdown().await,
+            Self::DoSession(client) => client.shutdown().await,
         }
     }
 
@@ -923,6 +937,7 @@ impl AppServerClient {
         match self {
             Self::InProcess(client) => AppServerRequestHandle::InProcess(client.request_handle()),
             Self::Remote(client) => AppServerRequestHandle::Remote(client.request_handle()),
+            Self::DoSession(client) => AppServerRequestHandle::DoSession(client.request_handle()),
         }
     }
 }

@@ -22,6 +22,8 @@ pub use app::ExitReason;
 use app_server_session::AppServerSession;
 use app_server_session::ThreadParamsMode;
 use codex_app_server_client::AppServerClient;
+pub use codex_app_server_client::DoSessionAppServerClient;
+pub use codex_app_server_client::DoSessionConnectArgs;
 use codex_app_server_client::DEFAULT_IN_PROCESS_CHANNEL_CAPACITY;
 use codex_app_server_client::InProcessAppServerClient;
 use codex_app_server_client::InProcessClientStartArgs;
@@ -314,16 +316,29 @@ async fn start_embedded_app_server(
     .await
 }
 
+/// How `run_main` should select the app-server transport. The CLI translates
+/// its launch intent into one of these; `run_main` then resolves it into a
+/// concrete `AppServerTarget`.
+pub enum AppServerLaunch {
+    /// Default behavior: probe for an implicit local daemon, otherwise embed.
+    Auto,
+    /// Explicit remote app-server endpoint (`--remote`).
+    Remote(RemoteAppServerEndpoint),
+    /// DigitalOcean hosted session (`do-sessions attach`).
+    DoSession(DoSessionConnectArgs),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AppServerTarget {
     Embedded,
     LocalDaemon { endpoint: RemoteAppServerEndpoint },
     Remote { endpoint: RemoteAppServerEndpoint },
+    DoSession { args: DoSessionConnectArgs },
 }
 
 impl AppServerTarget {
     pub(crate) fn uses_remote_workspace(&self) -> bool {
-        matches!(self, Self::Remote { .. })
+        matches!(self, Self::Remote { .. } | Self::DoSession { .. })
     }
 
     fn thread_params_mode(&self) -> ThreadParamsMode {
@@ -346,9 +361,9 @@ async fn init_state_db_for_app_server_target(
                 err.to_string(),
             ))
         }),
-        AppServerTarget::LocalDaemon { .. } | AppServerTarget::Remote { .. } => {
-            Ok(state_db::get_state_db(config).await)
-        }
+        AppServerTarget::LocalDaemon { .. }
+        | AppServerTarget::Remote { .. }
+        | AppServerTarget::DoSession { .. } => Ok(state_db::get_state_db(config).await),
     }
 }
 
@@ -462,6 +477,15 @@ async fn connect_remote_app_server(
     Ok(AppServerClient::Remote(app_server))
 }
 
+async fn connect_do_session_app_server(
+    args: DoSessionConnectArgs,
+) -> color_eyre::Result<AppServerClient> {
+    let client = DoSessionAppServerClient::connect(args)
+        .await
+        .wrap_err("failed to connect to DO session")?;
+    Ok(AppServerClient::DoSession(client))
+}
+
 #[cfg(unix)]
 async fn maybe_probe_default_daemon_socket(codex_home: &Path) -> Option<AbsolutePathBuf> {
     let socket_path = codex_app_server_client::app_server_control_socket_path(codex_home).ok()?;
@@ -528,6 +552,7 @@ async fn start_app_server(
         AppServerTarget::LocalDaemon { endpoint } | AppServerTarget::Remote { endpoint } => {
             connect_remote_app_server(endpoint.clone()).await
         }
+        AppServerTarget::DoSession { args } => connect_do_session_app_server(args.clone()).await,
     }
 }
 
@@ -875,7 +900,7 @@ pub async fn run_main(
     mut cli: Cli,
     arg0_paths: Arg0DispatchPaths,
     loader_overrides: LoaderOverrides,
-    explicit_remote_endpoint: Option<RemoteAppServerEndpoint>,
+    launch: AppServerLaunch,
 ) -> std::io::Result<AppExitInfo> {
     let strict_config = cli.strict_config;
     let (sandbox_mode, approval_policy) = if cli.dangerously_bypass_approvals_and_sandbox {
@@ -934,16 +959,19 @@ pub async fn run_main(
         strict_config,
         cli.bypass_hook_trust,
     );
-    let default_daemon = if explicit_remote_endpoint.is_none() && reuse_implicit_local_daemon {
+    let probing_default = matches!(launch, AppServerLaunch::Auto);
+    let default_daemon = if probing_default && reuse_implicit_local_daemon {
         maybe_probe_default_daemon_socket(&codex_home).await
     } else {
         None
     };
-    let app_server_target = app_server_target_for_launch(
-        explicit_remote_endpoint,
-        default_daemon,
-        reuse_implicit_local_daemon,
-    );
+    let app_server_target = match launch {
+        AppServerLaunch::DoSession(args) => AppServerTarget::DoSession { args },
+        AppServerLaunch::Remote(endpoint) => AppServerTarget::Remote { endpoint },
+        AppServerLaunch::Auto => {
+            app_server_target_for_launch(None, default_daemon, reuse_implicit_local_daemon)
+        }
+    };
     let remote_cwd_override = cli
         .cwd
         .clone()
